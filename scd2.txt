@@ -1,0 +1,49 @@
+
+
+// Stage the update by unioning two sets of rows
+// 1. Rows that will be inserted in the `whenNotMatched` clause
+// 2. Rows that will either UPDATE the current addresses of existing customers or INSERT the new addresses of new customers
+val stagedUpdates = newAddressesToInsert.
+  selectExpr("NULL as mergeKey", "updates.*").   // Rows for 1.
+  union(
+    updatesDF.as("updates").selectExpr("updates.customerId as mergeKey", "*")  // Rows for 2.
+  )
+
+println("Updates to perform")
+stagedUpdates.show(10, false)
+
+
+
+
+// Apply SCD Type 2 operation using merge
+customersTable.
+  as("customers").
+  merge(
+    stagedUpdates.as("staged_updates"),
+    "customers.customerId = mergeKey").
+  whenMatched("customers.current = true AND customers.address <> staged_updates.address").
+  updateExpr(Map(  // Set current to false and endDate to source's effective date.
+    "current" -> "false",
+    "endDate" -> "staged_updates.effectiveDate")).
+  whenNotMatched().
+  insertExpr(Map(
+    "customerid" -> "staged_updates.customerId",
+    "address" -> "staged_updates.address",
+    "current" -> "true",
+    "effectiveDate" -> "staged_updates.effectiveDate", // Set current to true along with the new address and its effective date.
+    "endDate" -> "null")).
+  execute()
+
+
+
+// View the saved data
+DeltaTable.forPath("/tmp/scd2/customers").toDF.show
+
+
+
+stagedUpdates = newAddressesToInsert.
+  selectExpr("NULL as mergeKey", "updates.*").   // Rows for 1.
+  union(
+    updatesDF.as("updates").selectExpr("updates.customerId as mergeKey", "*")  // Rows for 2.
+  )
+
