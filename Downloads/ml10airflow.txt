@@ -1,0 +1,266 @@
+from airflow import DAG
+from airflow.models import Variable
+from datetime import datetime
+from airflow.operators.python_operator import PythonOperator
+import boto3
+import json
+import requests
+import pandas as pd
+import pyarrow.parquet as pq
+import decimal
+
+
+def list_objects():
+    lists = []
+    prefix = "datasets/"
+    s3 = boto3.resource('s3')
+    bucket = s3.Bucket(name="rakeshnadukuda-lz-007")
+    FilesNotFound = True
+    for obj in bucket.objects.filter(Prefix=prefix):
+        lists.append('{0}:{1}'.format(bucket.name, obj.key))
+        FilesNotFound = False
+    if FilesNotFound:
+        print("ALERT", "No file in {0}/{1}".format(bucket, prefix))
+    dataset = []
+    result = [item.split('/')[1] for item in lists ]
+    print(result)
+    l = len(result)
+    for i in range(1,l):
+        dataset.append(result[i])
+    print(dataset)
+    return dataset
+    
+    
+
+
+def configdata(ti):
+    s3 = boto3.resource('s3')
+    obj = s3.Object("rakeshnadukuda-lz-007","datasets/appconfiguration.json")
+    content = obj.get()['Body'].read().decode()
+    print(content)
+    Data = json.loads(content)
+    print(Data)
+    ti.xcom_push(key='app',value=Data)
+
+
+
+
+def copy_data(ti,**kwargs):
+    #dataset = kwargs['dag_run'].conf['dataset_path']
+    #print("the dataset ##### is",dataset)
+    dataset = list_objects()
+    Data = ti.xcom_pull(key='app',task_ids='read_config_files')
+    s3 = boto3.resource('s3')
+    if(len(dataset)>=1):
+    		if 'Actives.parquet' in dataset:
+        		print("the dataset ##### is",dataset)
+        		actives_source=Data['landingzone-actives-rawzone']['source']['data-location'].split("/")
+        		actives_destination=Data['landingzone-actives-rawzone']['destination']['data-location'].split("/") 
+        		copy_source = {
+            		'Bucket': actives_source[2],
+            		'Key': actives_source[3]+"/"+actives_source[4]
+                }
+        		bucket = s3.Bucket(actives_destination[2])
+        		bucket.copy(copy_source, actives_destination[3]+"/"+"ActivesAirflow"+"/"+actives_destination[4]+".parquet")
+          else:
+            print("No Actives data present")
+    
+    		if 'Viewership.parquet' in dataset:
+        		print("the dataset ##### is",dataset)
+       		viewers_source=Data['landingzone-viewership-rawzone']['source']['data-location'].split("/")
+        		viewers_destination=Data['landingzone-viewership-rawzone']['destination']['data-location'].split("/")
+        		copy_source = {
+              		'Bucket': viewers_source[2],
+              		'Key': viewers_source[3]+"/"+viewers_source[4]
+            		}
+        		bucket1 = s3.Bucket(viewers_destination[2])
+        		bucket1.copy(copy_source, viewers_destination[3]+"/"+"ViewershipAirflow"+"/"+viewers_destination[4]+".parquet")
+          else:
+		  print("No viewership present")
+    else:
+       raise Exception("No data present")
+  
+
+
+
+def data_avaliablity(l):
+    if(len(l)>=1):
+        return True
+    else:
+        raise Exception("There is no data exists")
+
+
+
+
+def count_check_landingtoraw(l,r):
+    for i in l:
+        if(l[i].count()==r[i].count()):
+            print("data count matched columnname:",i)
+        else:
+            print("data count doesn't matched columname",i)
+
+
+def datatype_check(t,s): 
+    for i in t:
+        if t[i].split(",")[0] == "DecimalType":
+            if isinstance(s[i][0], decimal.Decimal) & (str(abs(decimal.Decimal(s[i][0]).as_tuple().exponent)) ==t[i].split(",")[1]):
+                print("Data type is valid  ",i)
+            else:
+                print("data type not valid",i)
+        if t[i] == "ArrayType-StringType":
+            if pd.api.types.is_string_dtype(s[i]):
+                print(f"Data type is valid for string type",i)
+            else:
+                print(f"Data type is invalid for string type",i)
+
+def prevalidation(ti,**kwargs):
+    Data = ti.xcom_pull(key='app',task_ids='read_config_files')
+    #dataset = kwargs['dag_run'].conf['dataset_path']
+    dataset= list_objects()
+    print("the dataset path is #######",dataset)
+    for i in dataset:
+        if 'Actives.parquet' == i:
+            actives_source=Data['landingzone-actives-rawzone']['source']['data-location']
+            actives_parquet_landing=pd.read_parquet(actives_source,engine='pyarrow')
+            data_avaliablity(actives_parquet_landing)
+            actives_destination=Data['landingzone-actives-rawzone']['destination']['data-location'] 
+            actives_destination_parquet_rawzone=pd.read_parquet(actives_destination,engine='pyarrow')
+            count_check_landingtoraw(actives_parquet_landing,actives_destination_parquet_rawzone)
+        if 'Viewership.parquet' == i:
+            viewers_source=Data['landingzone-viewership-rawzone']['source']['data-location']
+            viewers_parquet_landing=pd.read_parquet(viewers_source,engine='pyarrow')
+            data_avaliablity(viewers_parquet_landing)
+            viewers_destination=Data['landingzone-viewership-rawzone']['destination']['data-location']
+            viewers_destination_parquet_rawzone=pd.read_parquet(viewers_destination,engine='pyarrow')
+            count_check_landingtoraw(viewers_parquet_landing,viewers_destination_parquet_rawzone)
+global ec2
+ec2=boto3.client('ec2',region_name='ap-southeast-1')
+global emr
+emr=boto3.client('emr',region_name='ap-southeast-1')
+
+
+def  get_security_id(group_name):
+    response=ec2.describe_security_groups(GroupNames=[group_name])
+    group_id = response['SecurityGroups'][0]['GroupId']
+    return group_id
+
+
+def createcluster():
+    master_security_id = get_security_id('ElasticMapReduce-master')  
+    print(master_security_id)
+    print(type(master_security_id))
+    slave_security_id = get_security_id('ElasticMapReduce-master')
+    print(slave_security_id)
+    print(type(slave_security_id))
+    response = emr.run_job_flow(
+        Name=Variable.get("Name"),
+        ReleaseLabel=Variable.get("rl"),
+        Instances={
+            'InstanceGroups': [
+                {
+                    'Name': 'Master nodes',
+                    'Market': 'ON_DEMAND',
+                    'InstanceRole': 'MASTER',
+                    'InstanceType': 'm5.xlarge',
+                    'InstanceCount': 1,
+                }
+            ],
+            'Ec2KeyName': 'rakeshnkeypair',
+            'KeepJobFlowAliveWhenNoSteps': True,
+            'TerminationProtected': True,
+            'EmrManagedMasterSecurityGroup':master_security_id, 
+            'EmrManagedSlaveSecurityGroup': slave_security_id
+        },
+   BootstrapActions=[
+            {
+                'Name': 'Install boto3',
+                'ScriptBootstrapAction': {
+                            'Path': "s3://rakeshnadukuda-lz-007/deltajarfolder/package.sh",
+                        }
+            }
+            ],
+
+        Applications=[
+            {'Name': 'hadoop'},
+            {'Name': 'spark'},
+            {'Name': 'livy'},
+            {'Name': 'JupyterEnterpriseGateway'},
+            {'Name': 'JupyterHub'},
+ 
+        ],
+        VisibleToAllUsers=True,
+        JobFlowRole='EMR_EC2_DefaultRole',
+        ServiceRole='EMR_DefaultRole',
+        AutoTerminationPolicy={
+            'IdleTimeout': 5400,
+        },
+    )
+    clusterid=response['JobFlowId']
+    return clusterid
+
+
+def wait_for_cluster(ti):
+    clusterid= ti.xcom_pull(task_ids='create_cluster')
+    print(clusterid)
+    emr.get_waiter('cluster_running').wait(ClusterId=clusterid)
+
+
+def retreive_dns(ti):
+    clusterid= ti.xcom_pull(task_ids='create_cluster')
+    print(clusterid)
+    response = emr.describe_cluster(ClusterId=clusterid)
+    dns=response['Cluster']['MasterPublicDnsName']
+    print(dns)
+    return dns 
+
+
+def spark_submit(ti):
+    dns=ti.xcom_pull(task_ids='retrieve_cluster_dns')
+    print(dns)
+    filepath="s3://rakeshnadukuda-lz-007/livy2/sparkthree.py"
+    url='http://' + dns + ':8998/batches'
+    print(url)
+    jsondata={"file": filepath, "className": "Actives"}
+    header = {'Content-Type': 'application/json'}
+    response=requests.post(url,json=jsondata)
+    print(response.text)
+    print(response.headers)
+
+def postvalidation(ti,**kwargs):
+    Data = ti.xcom_pull(key='app',task_ids='read_config_files')
+    #dataset = kwargs['dag_run'].conf['dataset_path']
+    #print("the dataset path is #######",dataset)
+    dataset = list_objects()
+    for i in dataset:
+        if 'Actives.parquet' == i:
+            actives_raw=Data['landingzone-actives-rawzone']['destination']['data-location'] 
+            actives_raw_parquet=pd.read_parquet(actives_raw,engine='pyarrow')
+            data_avaliablity(actives_raw_parquet)
+            actives_sz=Data['maskedcolumns-actives']['destination']['data-location']
+            actives_sz_parquet=pd.read_parquet(actives_sz,engine='pyarrow')
+            print(count_check_landingtoraw(actives_raw_parquet,actives_sz_parquet))
+            transform_cols_actives = Data['maskedcolumns-actives']['transformation-columns']
+            print(datatype_check(transform_cols_actives,actives_sz_parquet))
+           
+        if 'Viewership.parquet' == i:
+            viewers_raw=Data['landingzone-viewership-rawzone']['destination']['data-location']
+            viewers_raw_parquet=pd.read_parquet(viewers_raw,engine='pyarrow')
+            data_avaliablity(viewers_raw_parquet)
+            viewers_sz=Data['maskedcolumns-viewership']['destination']['data-location']
+            viewers_sz_parquet=pd.read_parquet(viewers_sz,engine='pyarrow')
+            print(count_check_landingtoraw(viewers_raw_parquet,viewers_sz_parquet))
+            transform_cols_viewers = Data['maskedcolumns-viewership']['transformation-columns']
+            print(datatype_check(transform_cols_viewers,viewers_sz_parquet))
+
+with  DAG(dag_id='ml10_dag',schedule_interval='@hourly',
+          start_date=datetime(2017, 3, 20), catchup=False) as dag:
+    config_data_task=PythonOperator(task_id="read_config_files",python_callable=configdata)
+    copy_data_task=PythonOperator(task_id="copy_the_data",python_callable=copy_data)
+    prevalidation_task=PythonOperator(task_id="prevalidate_data",python_callable=prevalidation)
+    create_cluster_task = PythonOperator(task_id="create_cluster",python_callable=createcluster)
+    waiting_cluster_task = PythonOperator(task_id="waiting_for_cluster",python_callable= wait_for_cluster)
+    retrieve_cluster_dns_task = PythonOperator(task_id="retrieve_cluster_dns",python_callable=retreive_dns)
+    livy_submit_task=PythonOperator(task_id="submit_to_livy",python_callable=spark_submit)
+    postvalidation_task=PythonOperator(task_id="postvalidate_data",python_callable=postvalidation)
+
+config_data_task>>copy_data_task>>prevalidation_task>>create_cluster_task>>waiting_cluster_task>>retrieve_cluster_dns_task>>livy_submit_task>>postvalidation_task
